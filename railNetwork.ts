@@ -15,7 +15,7 @@ import {
 // Import cache helpers, train pairing logic, and logging
 import { saveToCache, readFromCache } from './cache';
 import { TrainPair, checkForTrainPairs } from './trainPairs';
-import { log } from './customUtils';
+import { log, LOG_LABELS } from './customUtils';
 
 /**
  * Configuration for a rail network, loaded from config.json
@@ -58,6 +58,12 @@ interface RailNetworkConfig {
         randomizeTimeOffset?: boolean; // Whether to randomize time offset for display (used for WLG where all trains are updated simultaneously)
         colors: {
             [key: string]: [number, number, number]; // Mapping of route names to [R,G,B] color values
+        };
+        delayThresholds: {
+            early: number; // Delay in seconds for early trains (negative)
+            minor: number; // Delay in seconds for minor delay
+            moderate: number; // Delay in seconds for moderate delay
+            severe: number; // Delay in seconds for severe delay
         };
     };
 }
@@ -126,6 +132,12 @@ export class RailNetwork {
                     colors: IdToColor,
                     updates: [],
                 },
+                delayThresholds: {
+                    early: this.config.LEDRailsAPI.delayThresholds?.early,
+                    minor: this.config.LEDRailsAPI.delayThresholds?.minor,
+                    moderate: this.config.LEDRailsAPI.delayThresholds?.moderate,
+                    severe: this.config.LEDRailsAPI.delayThresholds?.severe
+                }
             });
         }
 
@@ -214,6 +226,121 @@ export class RailNetwork {
         }
 
         this.trackedTrains = updateTrackedTrains(this.trackBlocks, this.trackedTrains, this.trainEntities, this.config.LEDRailsAPI.displayThreshold, this.invisibleTrains, this.id);
+
+        // After fetching fresh data, extract delays from tripupdates and update tracked trains
+
+        const freshTripUpdates = freshData?.entity?.filter(e => {
+            if (!e.trip_update) return false; // only want trip updates
+
+            if (this.config.trainFilter.entityID) { // filter by entity ID range (only want trains)
+                const idNum = Number(e.trip_update.vehicle?.id);
+                if (!idNum) return false;
+                return idNum >= this.config.trainFilter.entityID.start && 
+                       idNum <= this.config.trainFilter.entityID.end;
+            } else if (this.config.trainFilter.trip_ID) { // filter by trip_id substring
+                const includesStr = this.config.trainFilter.trip_ID?.includes;
+                return includesStr !== undefined && 
+                       e.trip_update.trip?.trip_id?.includes(includesStr);
+            }
+            return false;
+        });
+
+        // After filtering freshTripUpdates
+        const vehicleUpdateMap = new Map<string, Entity>();
+
+
+        for (const entity of freshTripUpdates) {
+            const vehicleId = entity.trip_update?.vehicle?.id;
+            if (!vehicleId) continue;
+
+            // If this vehicleId is not in the map, or this entity is newer, replace it
+            const existing = vehicleUpdateMap.get(vehicleId);
+            const newTimestamp = entity.trip_update?.timestamp ?? 0;
+            const existingTimestamp = existing?.trip_update?.timestamp ?? 0;
+
+            if (!existing || newTimestamp > existingTimestamp) {
+                vehicleUpdateMap.set(vehicleId, entity);
+            }
+}
+
+        // Now use only the most recent trip update for each trip_id
+        // After deduplication
+        const now = Math.floor(Date.now() / 1000); // current time in seconds
+        const dedupedTripUpdates = Array.from(vehicleUpdateMap.values())
+            .filter(entity => {
+                const ts = entity.trip_update?.timestamp ?? 0;
+                return (now - ts) <= 300; // Only include updates from the last 5 minutes
+            });
+
+        if (dedupedTripUpdates) {
+            log(LOG_LABELS.SYSTEM, `Processing ${dedupedTripUpdates.length} trip updates for delays`);
+            var onTimeCount = 0;
+            for (const entity of dedupedTripUpdates) {
+                const tripUpdate = entity.trip_update;
+                
+                // Add debug logging
+                // log(LOG_LABELS.SYSTEM, `Processing trip update: ${JSON.stringify(tripUpdate, null, 2)}`);
+                
+                if (tripUpdate?.stop_time_update == null) {
+                    log(LOG_LABELS.SYSTEM, `Skipping a trip update with no stop_time_update`);
+                    continue;
+                }
+
+                // Split this into separate lines for debugging
+                const departureDelay = tripUpdate?.stop_time_update?.departure?.delay;
+                const arrivalDelay = tripUpdate?.stop_time_update?.arrival?.delay;
+                // log(LOG_LABELS.SYSTEM, `Departure delay: ${departureDelay},\n\t\t Arrival delay: ${arrivalDelay}`);
+                
+                const delay = arrivalDelay ?? departureDelay; // Treat arrival delay as primary, fallback to departure delay
+
+                // skip if stop_time_update or arrival or delay is null/undefined
+                if (delay == null) {
+                    log(LOG_LABELS.SYSTEM, `Skip Entity, no delay info available: ${JSON.stringify(tripUpdate?.stop_time_update)}`);
+                    continue;
+                }
+
+                const vehicleId = tripUpdate.vehicle?.id;
+                const vehicleLabel = tripUpdate.vehicle?.label;
+                if (!vehicleId) {
+                    // log(LOG_LABELS.SYSTEM, `Skip update: no vehicle id on incoming entity`);
+                    continue;
+                }
+
+                // Update the corresponding tracked train
+                const trackedTrain = this.trackedTrains.find(t => t.trainId === vehicleId);
+                if (trackedTrain) {
+                    trackedTrain.delaySeconds = delay;
+                    trackedTrain.delayStatus = this.getDelayColor(delay);
+                    if (trackedTrain.delayStatus !== 'ON_TIME') {
+                        const minutes = Math.floor(Math.abs(delay) / 60);
+                        const seconds = Math.abs(delay) % 60;
+                        const sign = delay < 0 ? '-' : '+';
+                        log(LOG_LABELS.SYSTEM, `${tripUpdate.trip.trip_id} ${vehicleLabel}\tdelay ${sign} ${minutes}:${seconds}\t${trackedTrain.delayStatus}`);
+                    } else {
+                        // increment the on-time log count
+                        onTimeCount++;
+                    }
+                } else {
+                    //log(LOG_LABELS.SYSTEM, `No tracked train for vehicle ${vehicleId}`);
+                }
+            }
+            const percentage = Math.round((onTimeCount / dedupedTripUpdates.length) * 100);
+            log(LOG_LABELS.SYSTEM, `Total on-time trains: ${onTimeCount} of ${dedupedTripUpdates.length} (${percentage}%)`);
+        }
+    }
+
+    getDelayColor(delay?: number): string {
+        var delayState = 'ON_TIME'; // On-Time until proven otherwise
+        if (!delay) return delayState;
+        
+        const thresholds = this.config.LEDRailsAPI.delayThresholds;
+        if (delay <= thresholds.early) delayState = 'EARLY';
+        if (delay >= thresholds.minor) delayState = 'DELAY_MINOR';
+        if (delay >= thresholds.moderate) delayState = 'DELAY_MODERATE';
+        if (delay >= thresholds.severe) delayState = 'DELAY_SEVERE';
+        // log(LOG_LABELS.SYSTEM, `Determined delay status: ${delayState} (${delay}s)`);
+        
+        return delayState;
     }
 
     /**
@@ -226,7 +353,7 @@ export class RailNetwork {
     async updateLEDRailsAPIs() {
         for (let index = 0; index < this.ledRailsAPIs.length; index++) {
             const api = this.ledRailsAPIs[index];
-            if (api) {
+            if (api) {                
                 this.ledRailsAPIs[index] = generateLedMap(api, this.trackedTrains, this.invisibleTrains);
             }
         }

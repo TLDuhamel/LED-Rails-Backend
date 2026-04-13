@@ -315,13 +315,16 @@ export class RailNetwork {
                         const minutes = Math.floor(Math.abs(delay) / 60);
                         const seconds = Math.abs(delay) % 60;
                         const sign = delay < 0 ? '-' : '+';
-                        log(LOG_LABELS.SYSTEM, `${tripUpdate.trip.trip_id} ${vehicleLabel}\tdelay ${sign} ${minutes}:${seconds}\t${trackedTrain.delayStatus}`);
+                        log(
+                            LOG_LABELS.SYSTEM,
+                            `${(tripUpdate.trip.route_id ?? '').padEnd(10)} ${vehicleLabel?.replace(/\s+/g, ' ').padEnd(10)}delay ${sign} ${minutes}:${seconds}\t${trackedTrain.delayStatus}`
+                        );
                     } else {
                         // increment the on-time log count
                         onTimeCount++;
                     }
                 } else {
-                    //log(LOG_LABELS.SYSTEM, `No tracked train for vehicle ${vehicleId}`);
+                    log(LOG_LABELS.ERROR, `No tracked train for vehicle ${vehicleId}`);
                 }
             }
             const percentage = Math.round((onTimeCount / dedupedTripUpdates.length) * 100);

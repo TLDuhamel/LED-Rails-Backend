@@ -327,7 +327,7 @@ function addNewTrain(trackedTrains: TrainInfo[], gtfsTrain: Entity): void {
         },
         route: String(vehicle?.trip?.route_id ?? 'OUT-OF-SERVICE'),
         delaySeconds: 0, // default to 0
-        delayStatus: 'DELAY_MINOR', // default to DELAY_MINOR until proven otherwise
+        delayStatus: 'ON_TIME', // default to ON_TIME until a trip update proves otherwise
         currentBlock: undefined,
         previousBlock: undefined,
         tripId: vehicle?.trip?.trip_id

@@ -126,10 +126,20 @@
     <script>
         // --- Configuration ---
         const API_ENDPOINT = window.location.pathname.replace(/\/api\/map/, '/api/vehicles/trains');
+        const TRACKED_TRAINS_ENDPOINT = window.location.pathname.replace(/\/api\/map/, '/api/trackedtrains');
         const REFRESH_INTERVAL_MS = 10 * 1000; // Refresh every 10 seconds
         const INITIAL_ZOOM_LEVEL = 12;
         const STATUS_ELEMENT = document.getElementById('status');
         const STALE_TIMEOUT_MS = 15 * 60 * 1000; // 15 mins to consider vehicle stale
+
+        // --- Delay Status Colors (from config) ---
+        const DELAY_COLORS = {
+            'EARLY': '#00B4B4',
+            'ON_TIME': '#00C800',
+            'DELAY_MINOR': '#FF8C00',
+            'DELAY_MODERATE': '#FF0000',
+            'DELAY_SEVERE': '#DC0064',
+        };
 
         // --- Relative Time Formatter ---
         function getRelativeTime(timestamp) {
@@ -180,6 +190,7 @@
         };
         const DEFAULT_ARROW_COLOR = '#ff00ff';
         let vehicleLabels = new Map(); // Map label (lowercase) to vehicleId
+        let delayLookup = new Map(); // Map trainId to { delaySeconds, delayStatus }
 
         // --- Search UI ---
         const searchInput = document.getElementById('vehicle-search');
@@ -230,11 +241,30 @@
             });
         }
 
+        function formatDelay(delaySeconds) {
+            if (delaySeconds === undefined || delaySeconds === null) return null;
+            const abs = Math.abs(delaySeconds);
+            const mins = Math.floor(abs / 60);
+            const secs = abs % 60;
+            const sign = delaySeconds < 0 ? '-' : '+';
+            return mins > 0 ? `${sign}${mins}m${secs ? ` ${secs}s` : ''}` : `${sign}${secs}s`;
+        }
+
+        function getDelayBadge(vehicleId) {
+            const info = delayLookup.get(vehicleId);
+            if (!info) return '';
+            const color = DELAY_COLORS[info.delayStatus] || '#888';
+            const label = info.delayStatus.replace('_', ' ');
+            const delayStr = formatDelay(info.delaySeconds);
+            return `<div style="margin:4px 0 6px;padding:4px 8px;border-radius:4px;background:${color};color:#fff;font-weight:bold;font-size:1.1em;display:inline-block;">${delayStr} (${label})</div><br>`;
+        }
+
         // Helper to generate popup content for a vehicle
         function getVehiclePopupContent(vehicleInfo, vehicleId, trip, direction, latitude, longitude, position, vehicleData) {
             return `
                 ${vehicleInfo?.label ? `<b>Label:</b> ${vehicleInfo.label}<br>` : ''}
                 ${vehicleId ? `<b>Vehicle ID:</b> ${vehicleId}<br>` : ''}
+                ${getDelayBadge(vehicleId)}
                 ${trip?.route_id ? `<b>Route:</b> ${trip.route_id + (direction || '')}<br>` : ''}
                 ${trip?.trip_id ? `<b>Trip:</b> ${trip.trip_id}<br>` : ''}
                 ${latitude !== undefined ? `<b>Lat:</b> ${latitude.toFixed(5)}<br>` : ''}
@@ -250,8 +280,22 @@
         let hasSetView = false;
         async function fetchAndDisplayVehicles() {
             try {
-                const response = await fetch(API_ENDPOINT);
+                const [response, trackedResponse] = await Promise.all([
+                    fetch(API_ENDPOINT),
+                    fetch(TRACKED_TRAINS_ENDPOINT),
+                ]);
                 const vehicleEntities = await response.json();
+                const trackedTrains = await trackedResponse.json();
+
+                // Build delay lookup from tracked trains
+                delayLookup.clear();
+                trackedTrains.forEach(t => {
+                    delayLookup.set(t.trainId, {
+                        delaySeconds: t.delaySeconds,
+                        delayStatus: t.delayStatus,
+                    });
+                });
+
                 const seenVehicleIds = new Set();
 
                 vehicleEntities.forEach(entity => {
@@ -267,7 +311,8 @@
                     const trip = vehicleData?.trip;
                     const routeId = trip?.route_id;
                     const direction = `-${trip?.direction_id} `;
-                    const arrowColor = ROUTE_COLORS[routeId] || DEFAULT_ARROW_COLOR;
+                    const delayInfo = delayLookup.get(vehicleId);
+                    const arrowColor = delayInfo ? (DELAY_COLORS[delayInfo.delayStatus] || DEFAULT_ARROW_COLOR) : (ROUTE_COLORS[routeId] || DEFAULT_ARROW_COLOR);
 
                     if (vehicleId && position?.latitude && position?.longitude) {
                         seenVehicleIds.add(vehicleId);
